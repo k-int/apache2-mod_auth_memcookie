@@ -21,7 +21,7 @@
  */
 
 /* Chas Woodfield 7th October 2014
- * Merged the 2 versions https://github.com/richp10/apache2-mod_auth_memcookie-1.0.3 and https://github.com/richp10/apache2-mod_auth_memcookie
+ * Merged the 2 versions https://github.com/richp10/apache2-mod_auth_memcookie-1.0.3 and https://github.com/raghu600/apache2-mod_auth_memcookie
  * Added an extra couple of config options:
  *     Auth_memCookie_RedirectURLOnFailure ... If authorisation fails then redirect to the specified url
  *     Auth_memCookie_AcceptPathStart ........ If authorisation fails and the path starts with the specified string, then accept the authorisation

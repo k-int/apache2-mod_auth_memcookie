@@ -9,3 +9,17 @@
 	* bug fix of Auth_memCookie_SessionTableSize to 8 any time...
 	* complete rewrite of match ip option to make possible to use it behind reverse proxy and to check x-forwarded or via http header in place of apache remote_ip.
 
+2014-10-07 Chas Woodfield
+	* Merged the 2 versions https://github.com/richp10/apache2-mod_auth_memcookie-1.0.3 and https://github.com/raghu600/apache2-mod_auth_memcookie
+	* Added an extra couple of config options:
+	*     Auth_memCookie_RedirectURLOnFailure ... If authorisation fails then redirect to the specified url
+	*     Auth_memCookie_AcceptPathStart ........ If authorisation fails and the path starts with the specified string, then accept the authorisation
+	* Both of the above configuration settings can be achieved using apache config, but I was struggling to get it right,
+	* I did eventually get it right, but have chosen to leave these options in as it makes the config simpler.
+	* Added an extra couple of options for checking the remote IP, use Client-IP header and use X-Forwarded-For header if Client-IP header is not set
+	* Changed the authorisation to loop through the requires, so it must match all the require directives
+	* Authorisation will now check multiple groups and users in the require directives
+	* Configuration is now merged if you have configuration at multiple levels
+	* Fixed a few bugs in authorisation
+	* I havn't checked the creation of entries within memcached as we create the entries in another application
+	* Feels like I have done more, but I think that was down to frustration of debugging while doing other stuff, so havn't intentionally omitted any changes
