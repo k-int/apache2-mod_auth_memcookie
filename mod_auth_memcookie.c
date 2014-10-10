@@ -716,6 +716,20 @@ static apr_table_t *session_from_subrequest(request_rec *r, strAuth_memCookie_co
     return pAuthSession;
 }
 
+static bool checkPathStart(strAuth_memCookie_config_rec *conf, request_rec *r) {
+    bool bAuthorised = false;
+    if (conf->szAuth_memCookie_AcceptPathStart.value != NULL) {
+        /* Note: We ignore the GET */
+        if (!strncmp(r->the_request + 4, conf->szAuth_memCookie_AcceptPathStart.value, strlen(conf->szAuth_memCookie_AcceptPathStart.value))) {
+            bAuthorised = true;
+            /* Set the user field so we give the impression we are logged in, so the proxy url can kick in */
+            r->user = "Login";
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG|APLOG_NOERRNO, 0, r, ERRTAG  "Request matched AcceptPathStart");
+        }
+    }
+    return(bAuthorised);
+}
+
 /**************************************************
  * authentification phase: 
  * verify if cookie is set and if it is known in memcache server 
@@ -831,7 +845,10 @@ static int check_cookie_real1(strAuth_memCookie_config_rec *conf, request_rec *r
 
     /* still no session? goodbye */
     if (!pAuthSession) {
-        return HTTP_UNAUTHORIZED;
+        if (!checkPathStart(conf, r)) {
+            /* We have run out of options */
+            return HTTP_UNAUTHORIZED;
+        }
     }
 
     /* push session returned structure in request pool so we can access it in Auth_memCookie_check_auth() */
@@ -840,66 +857,68 @@ static int check_cookie_real1(strAuth_memCookie_config_rec *conf, request_rec *r
         return HTTP_UNAUTHORIZED;
     }
 
-    /* check remote ip if option is enabled */
-    if (conf->nAuth_memCookie_MatchIP_Mode.value != IP_MATCH_NOT_SET) {
-        char *szRemoteIP = NULL;
-        const char *szPotentialIP = NULL;
+    /* if we have a session, then we need to do other stuff */
+    if (pAuthSession != NULL) {
+        /* check remote ip if option is enabled */
+        if (conf->nAuth_memCookie_MatchIP_Mode.value != IP_MATCH_NOT_SET) {
+            char *szRemoteIP = NULL;
+            const char *szPotentialIP = NULL;
 
-        ap_log_rerror(APLOG_MARK,APLOG_DEBUG|APLOG_NOERRNO, 0,r,ERRTAG  "check MatchIP_Mode:%d",conf->nAuth_memCookie_MatchIP_Mode.value);
-        switch (conf->nAuth_memCookie_MatchIP_Mode.value) {
-            case IP_MATCH_VIA:
-                szPotentialIP = apr_table_get(r->headers_in, "Via");
-                break;
+            ap_log_rerror(APLOG_MARK,APLOG_DEBUG|APLOG_NOERRNO, 0,r,ERRTAG  "check MatchIP_Mode:%d",conf->nAuth_memCookie_MatchIP_Mode.value);
+            switch (conf->nAuth_memCookie_MatchIP_Mode.value) {
+                case IP_MATCH_VIA:
+                    szPotentialIP = apr_table_get(r->headers_in, "Via");
+                    break;
 
-            case IP_MATCH_X_FORWARDED:
-                szPotentialIP = apr_table_get(r->headers_in, "X-Forwarded-For");
-                break;
-
-            case IP_MATCH_CLIENT_IP:
-                szPotentialIP = apr_table_get(r->headers_in, "Client-IP");
-                break;
-
-            case IP_MATCH_CLIENT_IP_X_FORWARDED:
-                /* First look at client IP then X-Forward-For */
-                szPotentialIP = apr_table_get(r->headers_in, "Client-IP");
-                if (szPotentialIP == NULL) {
+                case IP_MATCH_X_FORWARDED:
                     szPotentialIP = apr_table_get(r->headers_in, "X-Forwarded-For");
-                }
-                break;
+                    break;
+
+                case IP_MATCH_CLIENT_IP:
+                    szPotentialIP = apr_table_get(r->headers_in, "Client-IP");
+                    break;
+
+                case IP_MATCH_CLIENT_IP_X_FORWARDED:
+                    /* First look at client IP then X-Forward-For */
+                    szPotentialIP = apr_table_get(r->headers_in, "Client-IP");
+                    if (szPotentialIP == NULL) {
+                        szPotentialIP = apr_table_get(r->headers_in, "X-Forwarded-For");
+                    }
+                    break;
+            }
+
+            if (szPotentialIP != NULL) {
+                szRemoteIP = apr_pstrdup(r->pool, szPotentialIP);
+            } else {
+                szRemoteIP = apr_pstrdup(r->pool, r->connection->client_ip);
+            }
+
+            if (strcmp(szRemoteIP, apr_table_get(pAuthSession,"RemoteIP"))) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, r, ERRTAG "unauthorized, by ip. user:%s remote_ip:%s != cookie_ip:%s", apr_table_get(pAuthSession,"UserName"),szRemoteIP ,apr_table_get(pAuthSession,"RemoteIP"));
+                return HTTP_UNAUTHORIZED;
+            }
         }
 
-        if (szPotentialIP != NULL) {
-            szRemoteIP = apr_pstrdup(r->pool, szPotentialIP);
-        } else {
-            szRemoteIP = apr_pstrdup(r->pool, r->connection->client_ip);
-        }
+        /* set MCAC-SESSIONKEY var for scripts language */
+        apr_table_setn(r->subprocess_env, "MCAC_SESSIONKEY", szCookieValue);
 
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG|APLOG_NOERRNO, 0, r, ERRTAG "check ip: remote_ip=%s cookie_ip=%s", szRemoteIP ,apr_table_get(pAuthSession,"RemoteIP"));
-        if (strcmp(szRemoteIP, apr_table_get(pAuthSession,"RemoteIP"))) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, r, ERRTAG "unauthorized, by ip. user:%s remote_ip:%s != cookie_ip:%s", apr_table_get(pAuthSession,"UserName"),szRemoteIP ,apr_table_get(pAuthSession,"RemoteIP"));
-            return HTTP_UNAUTHORIZED;
-        }
+        /* set env var MCAC_ to the information session value */
+        apr_table_do(DoSetEnv, r, pAuthSession, NULL);
+
+        /* set REMOTE_USER var for scripts language */
+        apr_table_setn(r->subprocess_env, "REMOTE_USER", apr_table_get(pAuthSession,"UserName"));
+
+        /* set in http header the session value */
+        if (conf->nAuth_memCookie_SetSessionHTTPHeader.value)
+            apr_table_do(doSetHeader, r, pAuthSession, NULL);
+
+        /* fix http header for php */
+        if (conf->nAuth_memCookie_authbasicfix.value)
+            fix_headers_in(r, apr_table_get(pAuthSession, "Password"));
     }
-
-    /* set env var MCAC_ to the information session value */
-    apr_table_do(DoSetEnv, r, pAuthSession, NULL);
-
-    /* set REMOTE_USER var for scripts language */
-    apr_table_setn(r->subprocess_env, "REMOTE_USER", apr_table_get(pAuthSession,"UserName"));
-
-    /* set MCAC-SESSIONKEY var for scripts language */
-    apr_table_setn(r->subprocess_env, "MCAC_SESSIONKEY", szCookieValue);
-    
-    /* set in http header the session value */
-    if (conf->nAuth_memCookie_SetSessionHTTPHeader.value)
-        apr_table_do(doSetHeader, r, pAuthSession, NULL);
 
     /* log authorisation ok */
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG|APLOG_NOERRNO, 0, r, ERRTAG "authentication ok");
-
-    /* fix http header for php */
-    if (conf->nAuth_memCookie_authbasicfix.value)
-        fix_headers_in(r, apr_table_get(pAuthSession, "Password"));
 
     /* if all is ok return auth ok */
     return OK;
@@ -913,7 +932,15 @@ static bool checkRedirect(strAuth_memCookie_config_rec *conf, request_rec *r) {
     bool redirected = false;
 
     if (conf->szAuth_memCookie_RedirectURLOnFailure.value && ap_strchr_c(conf->szAuth_memCookie_RedirectURLOnFailure.value, ':')) {
-        apr_table_setn(r->err_headers_out, "Location", conf->szAuth_memCookie_RedirectURLOnFailure.value);
+        /* Setting a cookie to say where we came from dosn't seem to work (could be I did something wrong), so we will append a parameter with the same name as the cookie name */
+        char *urlStart = strchr(r->the_request, ' ') + 1;
+        char *urlEnd = strchr(urlStart, ' ');
+        char *originatingURL = apr_pstrndup(r->pool, urlStart, urlEnd - urlStart);
+        char *url = apr_psprintf(r->pool, "%s%s%s=%s", conf->szAuth_memCookie_RedirectURLOnFailure.value,
+                                                       (ap_strchr_c(conf->szAuth_memCookie_RedirectURLOnFailure.value, '?') ? "&" : "?"),
+                                                       conf->szAuth_memCookie_CookieName.value,
+                                                       ap_escape_urlencoded(r->pool, originatingURL));
+        apr_table_setn(r->err_headers_out, "Location", url);
         redirected = true;
     }
     return(redirected);
@@ -959,7 +986,7 @@ static int Auth_memCookie_check_auth(request_rec *r) {
 
     /* check if module are authoritative and we are cookie authenticating*/
     if (!conf->nAuth_memCookie_Authoritative.value) {
-        return DECLINED;
+       return DECLINED;
     }
 
     if ((tRetStatus = apr_pool_userdata_get((void**)&pAuthSession, "SESSION", r->pool))) {
@@ -969,9 +996,8 @@ static int Auth_memCookie_check_auth(request_rec *r) {
 
     /* Even though the status above was successful, we still might not have a session, so an extra check is required */
     if (pAuthSession == NULL) {
-        /* We do not appear to have a session, so get out of here before we crash */
-        ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, r,ERRTAG "pAuthSession is null");
-        return HTTP_FORBIDDEN;
+        /* Have we been authorised by the beginning of the path */
+        return(checkPathStart(conf, r) ? OK : HTTP_FORBIDDEN);
     }
 
     /* get require line */
@@ -1033,19 +1059,6 @@ static int Auth_memCookie_check_auth(request_rec *r) {
             if (!bGroupFound) {
                 ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, ERRTAG  "user %s not in group", szMyUser);
                 bAuthorised = false;
-            }
-        }
-    }
-
-    /* Back door way to authorise a base path */
-    /* Originally added as I struggled with the apache config as it always came in here, but I worked out what I was doing wrong */
-    /* so this if block can probably be removed, along with the config setting Auth_memCookie_AcceptPathStart */
-    if (!bAuthorised) {
-        if (conf->szAuth_memCookie_AcceptPathStart.value != NULL) {
-            /* Note: We ignore the GET */
-            if (!strncmp(r->the_request + 4, conf->szAuth_memCookie_AcceptPathStart.value, strlen(conf->szAuth_memCookie_AcceptPathStart.value))) {
-                bAuthorised = true;
-                ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, r, ERRTAG  "Request matched AcceptPathStart");
             }
         }
     }
