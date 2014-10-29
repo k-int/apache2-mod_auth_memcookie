@@ -459,15 +459,38 @@ static int session_concat_func(void *req, const char *key, const char *value) {
     return 1;
 }
 
+/* store string with szCookieValue key into the memcached server */
+static int set_memcached(request_rec *r, strAuth_memCookie_config_rec *conf, char *szCookieValue, char *szCookieContents)
+{
+    int result = DECLINED;
+    if ((szCookieValue != NULL) && (szCookieContents != NULL)) {
+        char *szMemcached_addr = conf->szAuth_memCookie_memCached_addr.value;
+        memcached_st *mc_session = NULL;
+        memcached_server_st *servers = NULL;
+        memcached_return mc_err = 0;
+        size_t nGetKeyLen = strlen(szCookieValue);
+        apr_time_t tExpireTime = conf->tAuth_memCookie_MemcacheObjectExpiry;
+
+        /* put string into memcachd */
+        if ((mc_session = memcached_create(NULL)) == 0) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, r, ERRTAG "memcache lib init failed");
+        } else {
+            servers = memcached_servers_parse(szMemcached_addr);
+            memcached_server_push(mc_session, servers);
+            if ((mc_err = memcached_set(mc_session, szCookieValue, nGetKeyLen, szCookieContents, strlen(szCookieContents), tExpireTime, 0))) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, r, ERRTAG  "set_memcached memcached_set (key:%s) failed with errcode=%d", szCookieValue, mc_err);
+            } else {
+                result = OK;
+            }
+            memcached_free(mc_session);
+        }
+    }
+    return(result);
+}
+
 /* store session with szCookieValue key into the memcached server */
 static int set_session(request_rec *r, strAuth_memCookie_config_rec *conf, char *szCookieValue, apr_table_t *session)
 {
-    char *szMemcached_addr = conf->szAuth_memCookie_memCached_addr.value;
-    memcached_st *mc_session = NULL;
-    memcached_server_st *servers = NULL;
-    memcached_return mc_err = 0;
-    size_t nGetKeyLen = strlen(szCookieValue);
-    apr_time_t tExpireTime = conf->tAuth_memCookie_MemcacheObjectExpiry;
     struct session_concat_func_data fd;
 
     /* concat everything from the session into a single string */
@@ -477,21 +500,7 @@ static int set_session(request_rec *r, strAuth_memCookie_config_rec *conf, char 
     apr_table_do(session_concat_func, &fd, session, NULL);
     ap_log_rerror(APLOG_MARK,APLOG_DEBUG|APLOG_NOERRNO, 0,r,ERRTAG  "-> %s", fd.str);
 
-    /* put concatenated session into the memcachd */
-    if ((mc_session = memcached_create(NULL)) == 0) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, r, ERRTAG "memcache lib init failed");
-        return DECLINED;
-    }
-    servers = memcached_servers_parse(szMemcached_addr);
-    memcached_server_push(mc_session, servers);
-    if ((mc_err = memcached_set(mc_session, szCookieValue, nGetKeyLen, fd.str, strlen(fd.str), tExpireTime, 0))) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, r,ERRTAG  "set_session memcached_set (key:%s) failed with errcode=%d",szCookieValue,mc_err);
-        memcached_free(mc_session);
-        return DECLINED;
-    }
-    memcached_free(mc_session);
-
-    return OK;
+    return(set_memcached(r, conf, szCookieValue, fd.str));
 }
 
 /* delete session with szCookieValue key from the memcached server */
@@ -936,11 +945,36 @@ static bool checkRedirect(strAuth_memCookie_config_rec *conf, request_rec *r) {
         char *urlStart = strchr(r->the_request, ' ') + 1;
         char *urlEnd = strchr(urlStart, ' ');
         char *originatingURL = apr_pstrndup(r->pool, urlStart, urlEnd - urlStart);
-        char *url = apr_psprintf(r->pool, "%s%s%s=%s", conf->szAuth_memCookie_RedirectURLOnFailure.value,
-                                                       (ap_strchr_c(conf->szAuth_memCookie_RedirectURLOnFailure.value, '?') ? "&" : "?"),
-                                                       conf->szAuth_memCookie_CookieName.value,
-                                                       ap_escape_urlencoded(r->pool, originatingURL));
-        apr_table_setn(r->err_headers_out, "Location", url);
+        char *remoteHost = NULL;
+        char *szCookieId = NULL;
+        char *szCookieName = NULL;
+        char *szCookieValue = NULL;
+        char *setCookie = NULL;
+
+        /* Get hold of the remote host */
+        apr_getnameinfo(&remoteHost, r->connection->client_addr, 0);
+
+        /* create a new session cookie */
+        szCookieId = create_new_cookie(r, remoteHost);
+
+        /* Generate the cookie value */
+        szCookieValue = apr_pstrcat(r->pool, ((remoteHost == NULL) ? "" : remoteHost), "@@@", originatingURL, NULL);
+
+        /* Generate the cookie name */
+        szCookieName = apr_pstrcat(r->pool, conf->szAuth_memCookie_CookieName.value, "_pending", NULL);
+ap_log_rerror(APLOG_MARK, APLOG_DEBUG|APLOG_NOERRNO, 0, r, ERRTAG "Chas, cookie name: %s, id: %s, value: %s", szCookieName, szCookieId, szCookieValue);
+
+        /* Set the cookie in memcached */
+        set_memcached(r, conf, szCookieId, szCookieValue);
+
+        /* add set-cookie directive to headers */
+        setCookie = apr_psprintf(r->pool, "%s=%s; path=/; Max-Age=900; Secure; HttpOnly", szCookieName, szCookieId);
+        if (conf->szAuth_memCookie_CookieDomain.value && *conf->szAuth_memCookie_CookieDomain.value)
+            setCookie = apr_psprintf(r->pool, "%s; domain=%s", setCookie, conf->szAuth_memCookie_CookieDomain.value);
+        apr_table_add(r->err_headers_out, "Set-Cookie", setCookie);
+ap_log_rerror(APLOG_MARK, APLOG_DEBUG|APLOG_NOERRNO, 0, r, ERRTAG "Chas, Set-Cookie: %s", setCookie);
+
+        apr_table_setn(r->err_headers_out, "Location", conf->szAuth_memCookie_RedirectURLOnFailure.value);
         redirected = true;
     }
     return(redirected);
